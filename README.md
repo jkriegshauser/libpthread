@@ -11,6 +11,7 @@ Getting Started
 ===============
 
 A simple example:
+
 	#include <Windows.h>
 	#include <pthread.h>
 	#include <stdio.h>
