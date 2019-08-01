@@ -6,7 +6,7 @@
 //#define WIN32_LEAN_AND_MEAN 1
 #include <Windows.h>
 
-#define ABORT_IF(test) do { if ((test)) { abort(); } } while (0)
+#define ABORT_IF(test) do { if ((test)) { volatile DWORD lasterror = GetLastError(); abort(); (void)lasterror; } } while (0)
 #define RETURN_IF(test, val) do { if ((test)) { return (val); } } while (0)
 
 #if _DURANGO

@@ -130,8 +130,10 @@ struct pthread_barrier_s
 {
     int magic;
     unsigned count;
-    unsigned waiting;
     void *sem;
+    pthread_spinlock_t spin;
+    unsigned waiting;
+    volatile unsigned generation;
 };
 
 /* static vars */
@@ -145,20 +147,20 @@ static destructor destructors[PTHREAD_KEYS_MAX];
 __declspec(thread) static pthread_t _thisthread;
 static struct pthread_s _main_thread = 
 {
-    PTHREAD_MAGIC_PTHREAD,  // magic
-    0,                      // tid
-    { NULL, NULL },         // entry
-    NULL,                   // arg
-    NULL,                   // retval
-    NULL,                   // func
-    NULL,                   // h
-    joinable,               // joined
-    0,                      // canceled
-    PTHREAD_DEFAULT_ATTR,   // state
-    (cpu_set_t)-1,          // affinity
-    NULL,                   // cfn
-    { '\0' },               // name
-    { NULL }                // keys
+    PTHREAD_MAGIC_PTHREAD,  /* magic        */
+    0,                      /* tid          */
+    { NULL, NULL },         /* entry        */
+    NULL,                   /* arg          */
+    NULL,                   /* retval       */
+    NULL,                   /* func         */
+    NULL,                   /* h            */
+    joinable,               /* joined       */
+    0,                      /* canceled     */
+    PTHREAD_DEFAULT_ATTR,   /* state        */
+    (cpu_set_t)-1,          /* affinity     */
+    NULL,                   /* cfn          */
+    { '\0' },               /* name         */
+    { NULL }                /* keys         */
 };
 static pthread_mutex_t pthread_list_mutex = PTHREAD_MUTEX_INITIALIZER;
 static LIST_HEAD(pthread_list_t, pthread_s) pthread_list = LIST_HEAD_INITIALIZER(pthread_list_t);
@@ -171,10 +173,19 @@ static void  _pthread_convert_timespec(const struct timespec *tp, FILETIME *ft);
 
 static INLINE int _pthread_setstate(unsigned *state, int flag, int val)
 {
+    unsigned old, new;
     RETURN_IF(~flag & val, EINVAL);
 
-    *state &= ~flag;
-    *state |= val;
+    for (;;)
+    {
+        old = *state;
+        new = (old & ~flag) | val;
+        if ((unsigned)ATOMIC_CMPXCHG(state, new, old) == old)
+        {
+            break;
+        }
+        PROC_YIELD();
+    }
 
     return 0;
 }
@@ -605,8 +616,11 @@ void pthread_exit(void *result)
 
     ABORT_IF(!self || self->magic != PTHREAD_MAGIC_PTHREAD);
 
-    /* set the PTHREAD_EXITING flag, and abort if it was already set (recursively calling pthread_exit) */
-    ABORT_IF(ATOMIC_OR(&self->state, PTHREAD_EXITING) & PTHREAD_EXITING);
+    /* set the PTHREAD_EXITING flag */
+    /* this used to abort() if it was already set, but occasionally the user APC can be re-entered. It appears that Windows doesn't remove
+       a queued APC before calling it, so entering an alertable state again can re-call it. Therefore, everything in this function should
+       be re-enterable. */
+    ATOMIC_OR(&self->state, PTHREAD_EXITING);
     self->retval = result;
 
     /* pop and execute any cancellation handlers */
@@ -643,7 +657,7 @@ exit_retry2:
             goto exit_retry2;
         }
 
-        /* won the race to destroy thread data */
+        /* won the race to destroy thread data. if the thread is joined, then the thread that has joined will destroy the thread data */
         _pthread_destroy(self, 1);
         self = NULL; /* self is destroyed now */
     }
@@ -651,12 +665,12 @@ exit_retry2:
     if (use_win32_api)
     {
         /* Unknown how this thread started, so use Win32 API to terminate */
-        ExitThread(0);
+        ExitThread((DWORD)(size_t)result);
     }
     else
     {
         /* We started this thread, so terminate with _endthreadex */
-        _endthreadex(0);
+        _endthreadex((unsigned)(size_t)result);
     }
 }
 
@@ -707,7 +721,7 @@ int pthread_getname_np(pthread_t t, char *name, size_t len)
 {
     RETURN_IF(!t || t->magic != PTHREAD_MAGIC_PTHREAD, ESRCH);
     RETURN_IF(!name, EINVAL);
-    RETURN_IF(len < 16, ERANGE); // NOTE: This hard-coded value comes from the pthread spec, but we support longer strings.
+    RETURN_IF(len < 16, ERANGE); /* NOTE: This hard-coded value comes from the pthread spec, but we support longer strings. */
 
     memcpy(name, t->name, len < sizeof(t->name) ? len : sizeof(t->name));
     name[len - 1] = '\0';
@@ -773,6 +787,8 @@ static void WINAPI _pthread_cancel_self(ULONG_PTR ignore)
     (void)ignore;
     /* terminate */
     pthread_exit(PTHREAD_CANCELED);
+    /* THIS FUNCTION MUST NOT RETURN */
+    abort();
 }
 
 static int _pthread_async_cancel(pthread_t t)
@@ -785,7 +801,11 @@ static int _pthread_async_cancel(pthread_t t)
     context.ContextFlags = CONTEXT_CONTROL;
 
     /* t is guaranteed to be a different thread */
-    RETURN_IF(SuspendThread(h) == (DWORD)-1, ESRCH);
+    /* if the cancellation has already succeeded via the queued APC then this can fail */
+    if (SuspendThread(h) == (DWORD)-1)
+    {
+        return !(t->state & PTHREAD_EXITING) ? ESRCH : 0;
+    }
 
     /* make sure that we haven't started exiting yet */
     if (!(t->state & PTHREAD_EXITING))
@@ -809,10 +829,12 @@ static int _pthread_async_cancel(pthread_t t)
 
 int pthread_cancel(pthread_t t)
 {
+    int err;
+
     RETURN_IF(!t || t->magic != PTHREAD_MAGIC_PTHREAD, ESRCH);
 
-    /* deferred cancel always */
-    t->canceled = 1;
+    /* deferred cancel always; if we've already canceled then return */
+    RETURN_IF(ATOMIC_XCHG(&t->canceled, 1) != 0, 0); 
 
     /* Can't proceed if cancellation is disabled, but it will be checked when canceling is enabled. */
     RETURN_IF((t->state & PTHREAD_MASK_CANCELABLE_NP) == PTHREAD_CANCEL_DISABLE, 0);
@@ -824,14 +846,20 @@ int pthread_cancel(pthread_t t)
         return 0;
     }
 
-    /* try to queue a user apc in case the thread is in an alertable wait function */
+    /* try async cancel if allowed */
+    if ((t->state & PTHREAD_MASK_CANCELTYPE_NP) == PTHREAD_CANCEL_ASYNCHRONOUS)
+    {
+        err = _pthread_async_cancel(t);
+        if (err != 0)
+        {
+            return err;
+        }
+    }
+
+    /* Queue a user APC for when the thread enters a cancelable function */
     QueueUserAPC(_pthread_cancel_self, t->h, 0);
 
-    /* Return if deferred only */
-    RETURN_IF((t->state & PTHREAD_MASK_CANCELTYPE_NP) == PTHREAD_CANCEL_DEFERRED, 0);
-
-    /* try async cancel */
-    return _pthread_async_cancel(t);
+    return 0;
 }
 
 void pthread_testcancel(void)
@@ -971,7 +999,7 @@ int pthread_os_handle_np(pthread_t t, void **h)
     RETURN_IF(!t || t->magic != PTHREAD_MAGIC_PTHREAD, ESRCH);
 
     *h = t->h;
-    RETURN_IF(!*h, ESRCH); // Detached; handle already closed
+    RETURN_IF(!*h, ESRCH); /* Detached; handle already closed */
 
     return 0;
 }
@@ -1557,7 +1585,6 @@ FORCEINLINE static int _pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t 
 {
     int res;
     int retval = 0;
-	DWORD e = 0;
     HANDLE h;
     FILETIME ft;
 
@@ -1634,8 +1661,7 @@ again:
 
     default:
         /* bad news */
-		e = GetLastError();
-        abort();
+        ABORT_IF(1);
     }
 
     pthread_cleanup_pop(0);
@@ -1997,6 +2023,7 @@ int pthread_barrier_init(pthread_barrier_t *pbar, const pthread_barrierattr_t *a
 {
     HANDLE h = NULL;
     struct pthread_barrier_s *bar;
+    int res;
 
     RETURN_IF(!pbar, EINVAL);
     RETURN_IF(count == 0 || count > INT_MAX, EINVAL);
@@ -2017,6 +2044,7 @@ int pthread_barrier_init(pthread_barrier_t *pbar, const pthread_barrierattr_t *a
         return ENOMEM;
     }
 
+    RETURN_IF((res = pthread_spin_init(&bar->spin, 0)) != 0, res);
     bar->count = count;
     bar->waiting = 0;
     bar->sem = h;
@@ -2041,6 +2069,8 @@ int pthread_barrier_destroy(pthread_barrier_t *pbar)
         bar->sem = NULL;
     }
 
+    pthread_spin_destroy(&bar->spin);
+
     libpthread_free(bar);
 
     return 0;
@@ -2049,45 +2079,51 @@ int pthread_barrier_destroy(pthread_barrier_t *pbar)
 int pthread_barrier_wait(pthread_barrier_t *bar_)
 {
     struct pthread_barrier_s *bar;
-    int res;
-    unsigned newval, expect, temp;
 
     RETURN_IF(!bar_ || !*bar_ || (bar = *bar_)->magic != PTHREAD_MAGIC_BARRIER, EINVAL);
 
-    temp = bar->waiting;
-    do
-    {
-        ATOMIC_READ_WRITE_BARRIER();
-        expect = temp;
-        newval = temp;
-        if (++newval == bar->count) newval = 0;
-    } while ((temp = ATOMIC_CMPXCHG(&bar->waiting, newval, expect)) != expect);
+    ABORT_IF(pthread_spin_lock(&bar->spin) != 0);
 
-    if (newval == 0)
+    if (++bar->waiting == bar->count)
     {
         /* we are the releaser */
+
+        bar->waiting = 0; /* reset the waiting count */
+        ++bar->generation;
+
+        /* unlock the spin lock and release the waiting threads */
+        ABORT_IF(pthread_spin_unlock(&bar->spin) != 0);
+
         if (bar->sem)
         {
-            if (ReleaseSemaphore(bar->sem, (LONG)(bar->count - 1), NULL) != TRUE) { res = GetLastError(); abort(); }
+            ABORT_IF(ReleaseSemaphore(bar->sem, (LONG)(bar->count - 1), NULL) != TRUE);
         }
-        res = PTHREAD_BARRIER_SERIAL_THREAD;
+
+        return PTHREAD_BARRIER_SERIAL_THREAD;
     }
     else
     {
         /* must wait */
-        switch (WaitForSingleObject(bar->sem, INFINITE))
+        unsigned generation = bar->generation;
+
+        /* unlock the spin lock */
+        ABORT_IF(pthread_spin_unlock(&bar->spin) != 0);
+
+waitagain:
+        ABORT_IF(WaitForSingleObject(bar->sem, INFINITE) != WAIT_OBJECT_0);
+        if (bar->generation == generation)
         {
-        case WAIT_OBJECT_0:
-            res = 0;
-            break;
-
-        default:
-            abort(); /* unexpected error */
-            break;
+            /*
+            The generation hasn't changed, so we were spuriously woken. This should be rare.
+            We need to wake a different thread and then wait again.
+            */
+            ABORT_IF(ReleaseSemaphore(bar->sem, 1, NULL) != TRUE);
+            Sleep(0); /* Wake another thread if we can, otherwise we could get woken again */
+            goto waitagain;
         }
-    }
 
-    return res;
+        return 0;
+    }
 }
 
 int sched_yield(void)
