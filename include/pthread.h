@@ -103,7 +103,7 @@ struct sched_param
     int sched_priority;
 };
 
-typedef unsigned long long cpu_set_t;
+typedef size_t cpu_set_t;
 #define CPU_ALLOC(n) (0)
 #define CPU_FREE(n) ((void)n)
 

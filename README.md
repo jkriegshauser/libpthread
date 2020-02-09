@@ -12,7 +12,7 @@ Getting Started
 
 A simple example:
 
-	#include <Windows.h>
+```cpp
 	#include <pthread.h>
 	#include <stdio.h>
 	
@@ -48,3 +48,11 @@ A simple example:
 		printf("Thread returned: %p\n", output);
 		return 0;
 	}
+```
+
+Building
+========
+1. Run `vcvarsall.bat` or the Developer Command Prompt for your target version of Visual Studio
+2. `mkdir build && cd build`
+3. `cmake ..`
+4. `cmake --build .`

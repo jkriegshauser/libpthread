@@ -2435,7 +2435,7 @@ static inline void _force_inclusion() {}
 
 BOOL WINAPI DllMain(HINSTANCE hinstDll, DWORD fdwReason, LPVOID lpReserved)
 {
-    switch (reason)
+    switch (fdwReason)
     {
     case DLL_PROCESS_ATTACH:
         _pthread_init();
